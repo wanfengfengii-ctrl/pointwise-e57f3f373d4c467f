@@ -1,6 +1,7 @@
 """Spilling full outer reconciliation join. No output ordering guarantee."""
 import contextlib
 import hashlib
+import tempfile
 from spill import Metrics, Partition, encode
 
 def bucket(key, depth, fanout):
@@ -31,13 +32,70 @@ def local_outer(left, right):
             yield project(None, row)
 
 def tiled_outer(left, right, budget):
-    # Reuse the in-memory operator for each pair of bounded blocks.
+    # Hot-key / depth-limit fallback: a block nested loop with global match
+    # state so a match found in any block pair is never reported as missing.
+    # A per-block-pair full outer join would wrongly emit unmatched-side rows
+    # whenever matching rows land in different blocks.
+    #
+    # Pick the smaller partition as the outer side to minimize inner rescans.
+    # The outer side is scanned exactly once; every outer block scans the inner
+    # partition once, plus one final inner sweep to emit genuinely unmatched
+    # inner rows. Match markers live in a length-framed temp file (disk state is
+    # allowed to grow with the input), while in-memory helper state stays bound
+    # to the current block's capacity.
+    if left.size <= right.size:
+        outer, inner, outer_is_left = left, right, True
+    else:
+        outer, inner, outer_is_left = right, left, False
     cap = budget // 2
-    with left.blocks(cap) as left_blocks:
-        for a in left_blocks:
-            with right.blocks(cap) as right_blocks:
-                for b in right_blocks:
-                    yield from local_outer(a, b)
+    marker = tempfile.TemporaryFile(mode='w+b')
+    try:
+        with outer.blocks(cap) as outer_blocks:
+            for a in outer_blocks:
+                # Only outer rows in the current block need in-memory match state.
+                outer_hit = [False] * len(a)
+                with inner.blocks(cap) as inner_blocks:
+                    inner_pos = 0
+                    for b in inner_blocks:
+                        index = {}
+                        for j, row in enumerate(b):
+                            if row['key'] is not None:
+                                index.setdefault(row['key'], []).append(j)
+                        for ai, arow in enumerate(a):
+                            if arow['key'] is None:
+                                continue
+                            for j in index.get(arow['key'], ()):
+                                brow = b[j]
+                                outer_hit[ai] = True
+                                global_pos = inner_pos + j
+                                marker.seek(global_pos)
+                                marker.write(b'\x01')
+                                if outer_is_left:
+                                    yield project(arow, brow)
+                                else:
+                                    yield project(brow, arow)
+                        inner_pos += len(b)
+                for ai, arow in enumerate(a):
+                    if not outer_hit[ai]:
+                        if outer_is_left:
+                            yield project(arow, None)
+                        else:
+                            yield project(None, arow)
+        # Final inner sweep: emit each inner row that never matched any outer row.
+        marker.seek(0)
+        with inner.blocks(cap) as inner_blocks:
+            inner_pos = 0
+            for b in inner_blocks:
+                for j, brow in enumerate(b):
+                    flag = marker.read(1)
+                    if flag != b'\x01':
+                        if outer_is_left:
+                            yield project(None, brow)
+                        else:
+                            yield project(brow, None)
+                inner_pos += len(b)
+    finally:
+        marker.close()
 
 def solve(left, right, budget, fanout, depth, metrics):
     if not left.count or not right.count:
