@@ -1,0 +1,27 @@
+{
+  "budget": 512,
+  "left": [
+    {
+      "id": "L1",
+      "key": "station-7",
+      "payload": "reading=12"
+    },
+    {
+      "id": "L2",
+      "key": null,
+      "payload": "unlabelled"
+    }
+  ],
+  "right": [
+    {
+      "id": "R1",
+      "key": "station-7",
+      "payload": "reading=13"
+    },
+    {
+      "id": "R2",
+      "key": null,
+      "payload": "unlabelled"
+    }
+  ]
+}
